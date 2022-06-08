@@ -6,12 +6,19 @@ import src.helpers as helpers
 from datetime import datetime
 import sys
 import src.xxapi as xxapi
+import json_fix
+import json
+import os
+
+g_all_nominators = {}
 
 class XXNetworkInterfaceExtended(xxapi.XXNetworkInterface):
-    def __init__(self, url: str = "ws://localhost:9944", logfile: str = "", verbose: bool = False, staking_verbose: bool = False):
+    def __init__(self, url: str = "ws://localhost:9944", logfile: str = "", verbose: bool = False,
+            staking_verbose: bool = False, write_waiting_list: bool = False):
         super(XXNetworkInterfaceExtended, self).__init__(url=url, logfile=logfile, verbose=verbose)
         global g_staking_verbose
         g_staking_verbose = staking_verbose
+        self.write_waiting_list = (write_waiting_list == "true")
 
     def info_waiting_list(self):
         self.get_data()
@@ -33,7 +40,8 @@ class XXNetworkInterfaceExtended(xxapi.XXNetworkInterface):
             if validator not in all_nominators:
                 all_nominators[validator] = {"targets": [validator]}
 
-        self.all_nominators = dict(map(lambda kv: (kv[0], NominatorInfo(kv[0], kv[1])), all_nominators.items()))
+        global g_all_nominators
+        g_all_nominators = dict(map(lambda kv: (kv[0], NominatorInfo(kv[0], kv[1])), all_nominators.items()))
 
         # Determine keys of validators in Waiting list
         active_validator_keys = self.item_query("Session", "Validators") # Currently 360 active validators
@@ -48,26 +56,26 @@ class XXNetworkInterfaceExtended(xxapi.XXNetworkInterface):
     def setup_auxiliary_data(self):
         # Create a map from validators -> nominators
         self.all_validators = {}
-        for nominator, nominatorInfo in self.all_nominators.items():
-            for validator in nominatorInfo.targets:
+        for nominator, nominator_info in g_all_nominators.items():
+            for validator in nominator_info.targets:
                 if validator not in self.all_validators:
                     self.all_validators[validator] = ValidatorInfo(validator)
-                self.all_validators[validator].add_nominator(nominator)
+                self.all_validators[validator].add_nominator(nominator, nominator_info)
 
         # Determine for each entry in the ledger the bonded amount of coins
         for key in self.ledger:
             nominator_key = self.ledger[key]["stash"]
             bonded = self.ledger[key]["active"] / 1_000_000_000
-            if nominator_key not in self.all_nominators:
+            if nominator_key not in g_all_nominators:
                 continue # Not sure what these are (old non-active accounts?); skip them
-            nominator = self.all_nominators[nominator_key]
+            nominator = g_all_nominators[nominator_key]
             nominator.bonded = bonded
 
     def process_data(self):
         self.waiting_validator_infos = []
         for validator_key in self.waiting_validator_keys:
             validator = self.all_validators[validator_key]
-            validator.estimate_effective_stake(self.all_nominators)
+            validator.estimate_effective_stake()
             self.waiting_validator_infos.append(validator)
 
     def output_info(self):
@@ -85,12 +93,25 @@ class XXNetworkInterfaceExtended(xxapi.XXNetworkInterface):
             key = validator.key
             eff_stake = validator.effective_stake
             self_stake = validator.self_stake
-            n = validator.nominators
-            log.info(f"{(index+1):3d} Validator: {key}, effective stake {eff_stake:8.0f}, self_stake {self_stake:8.0f}, {len(n):3d} nominators")
+            n = validator.number_of_nominators()
+            log.info(f"{(index+1):3d} Validator: {key}, effective stake {eff_stake:8.0f}, self_stake {self_stake:8.0f}, {n:3d} nominators")
         log.info(" ")
 #         p.s. to pretty print arrays and dicts:
-#         str = pprint.pformat(self.all_nominators)
+#         str = pprint.pformat(g_all_nominators)
 #         log.info(str)
+
+        if self.write_waiting_list:
+            self.write_waiting_list_to_file()
+
+    def write_waiting_list_to_file(self):
+            curr_era = self.item_query("Staking", "ActiveEra")
+            curr_era = curr_era['index']
+            basename = f"{curr_era}.json"
+            path = os.path.join(os.getcwd(), "info_waiting_lists")
+            os.makedirs(path, exist_ok = True)
+            filename = os.path.join(path, basename)
+            with open(os.path.join(path, filename), "w") as write_file:
+                json.dump(self.waiting_validator_infos, write_file, indent=4)
 
 class NominatorInfo():
     def __init__(self, key, data):
@@ -100,24 +121,36 @@ class NominatorInfo():
     def number_of_validators(self):
         return len(self.targets)
 
+    def __json__(self):
+        my_dict = self.__dict__
+        return my_dict
+
 class ValidatorInfo():
     def __init__(self, key):
         self.key = key
-        self.nominators = set({key})
         self.total_stake = 0
         self.effective_stake = 0
         self.self_stake = 0
+        if key in g_all_nominators:
+            nominator_info = g_all_nominators[key]
+        else:
+            nominator_info = NominatorInfo(key, {"targets": [key]})
+        self.nominators = {key: nominator_info}
 
-    def add_nominator(self, key):
-        self.nominators.add(key)
+    def number_of_nominators(self):
+        return len(self.nominators)
 
-    def estimate_effective_stake(self, all_nominators):
+    def add_nominator(self, key, nominator_info):
+        if key in self.nominators:
+            return
+        self.nominators[key] = nominator_info
+
+    def estimate_effective_stake(self):
         if g_staking_verbose:
             log.info(f"Validator: {self.key} - {len(self.nominators)} nominators")
-        for nominator_key in self.nominators:
-            nominator = all_nominators[nominator_key]
-            bonded = nominator.bonded
-            n = nominator.number_of_validators()
+        for nominator_key, nominator_info in self.nominators.items():
+            bonded = nominator_info.bonded
+            n = nominator_info.number_of_validators()
             if g_staking_verbose:
                 log.info(f"    Nominator: {nominator_key} - bonded {bonded:8.0f} - {n:3d} validators")
             self.total_stake = self.total_stake + bonded
@@ -125,3 +158,7 @@ class ValidatorInfo():
             self.effective_stake = self.effective_stake + effective_stake
             if nominator_key == self.key:
                 self.self_stake = bonded
+
+    def __json__(self):
+        my_dict = self.__dict__
+        return my_dict
