@@ -3,6 +3,7 @@ import pprint
 from substrateinterface import SubstrateInterface, Keypair  # pip3 install substrate-interface
 from substrateinterface.exceptions import SubstrateRequestException
 import src.helpers as helpers
+import src.tmapi as tmapi
 from datetime import datetime
 import sys
 import src.xxapi as xxapi
@@ -30,6 +31,11 @@ class XXNetworkInterfaceExtended(xxapi.XXNetworkInterface):
         self.output_info()
 
     def get_data(self):
+        # Get Team Multipliers
+        self.tm_values = tmapi.TeamMultiplierApi().current_tm_values()
+        if len(self.tm_values) == 0:
+            log.info(f"\n\n    TM values could not be retrieved - will continue without taking into account TM values\n\n")
+
         # all_nominators is a dictionary with key: nominator and value: {submitted_in: Int, suppressed: Bool, targets: Array}
         # targets contains the keys of the validators nominated
         all_nominators = self.map_query("Staking", "Nominators", "")
@@ -71,6 +77,11 @@ class XXNetworkInterfaceExtended(xxapi.XXNetworkInterface):
             nominator = g_all_nominators[nominator_key]
             nominator.bonded = bonded
 
+        # Set TM values
+        for validator_key, tm_value in self.tm_values.items():
+            validator = self.all_validators[validator_key]
+            validator.tm_value = tm_value
+
     def process_data(self):
         self.waiting_validator_infos = []
         for validator_key in self.waiting_validator_keys:
@@ -94,7 +105,8 @@ class XXNetworkInterfaceExtended(xxapi.XXNetworkInterface):
             eff_stake = validator.effective_stake
             self_stake = validator.self_stake
             n = validator.number_of_nominators()
-            log.info(f"{(index+1):3d} Validator: {key}, effective stake {eff_stake:8.0f}, self_stake {self_stake:8.0f}, {n:3d} nominators")
+            add_tm_info = f", TM {validator.tm_value:8.0f}" if validator.tm_value else ""
+            log.info(f"{(index+1):3d} Validator: {key}, effective stake {eff_stake:8.0f}, self_stake {self_stake:8.0f}, {n:3d} nominators{add_tm_info}")
         log.info(" ")
 #         p.s. to pretty print arrays and dicts:
 #         str = pprint.pformat(g_all_nominators)
@@ -131,6 +143,7 @@ class ValidatorInfo():
         self.total_stake = 0
         self.effective_stake = 0
         self.self_stake = 0
+        self.tm_value = None
         if key in g_all_nominators:
             nominator_info = g_all_nominators[key]
         else:
@@ -147,7 +160,11 @@ class ValidatorInfo():
 
     def estimate_effective_stake(self):
         if g_staking_verbose:
-            log.info(f"Validator: {self.key} - {len(self.nominators)} nominators")
+            log.info(f"Validator: {self.key} - {len(self.nominators)} nominators, TM: {self.tm_value}")
+
+        if self.tm_value:
+            self.effective_stake = self.tm_value
+
         for nominator_key, nominator_info in self.nominators.items():
             bonded = nominator_info.bonded
             n = nominator_info.number_of_validators()
